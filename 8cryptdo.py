@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 AeroModes <mail@aeromod.es>
+# SPDX-License-Identifier: MIT
+"""8CryptDo v1.0: 8BitDo firmware encryption tool
+
+Usage:
+ - 8cryptdo.py decrypt in.dat -o out.bin
+ - 8cryptdo.py encrypt template.dat payload.bin -o new.dat
+
+GitHub: https://github.com/aeromodes/8cryptdo
+"""
+
+import sys
+import struct
+import argparse
+
+UINT32_MAX = 0xFFFFFFFF
+
+STEP = 0x92A753FA
+A_MUL = 0x80000301
+ROT = 18
+BLOCK = 128
+MIRROR_XOR = 0xF9
+
+SEED_TABLE = (
+    0x0BD7, 0x50C3, 0x3071, 0x722A, 0x848D, 0x0DD7, 0x5B3E, 0x56EF, 0x3AD3,
+    0x510A, 0x0147, 0x417A, 0x886C, 0x12AE, 0x3C9C, 0x5DD3, 0x2D6E, 0x615B,
+    0xD68B, 0x5BCC, 0xD3E3, 0x2D48, 0xC15B, 0xA342, 0x5E54, 0x4D90, 0xAF30,
+    0x7A74, 0x05A8, 0x5E0B, 0x53B4, 0xC56A, 0xDB56, 0x6F88, 0x367E, 0x3814,
+    0x4E53, 0x184E, 0x2227, 0x0024, 0x7705, 0x4FD0, 0x42AE, 0x71C5, 0x5004,
+    0xBFF0, 0x1E71, 0x3330, 0xF02A, 0x470B, 0x4142, 0x2EA0, 0x56EC, 0x424F,
+    0x7982, 0x1361, 0xD7C3, 0x0DC8, 0x1552, 0x5537, 0xA2B9, 0x4E96, 0x7243,
+    0xA00A, 0xC620, 0xED93, 0xE24F, 0x82DC, 0x0BE4, 0x240B, 0x7118, 0xDD34,
+    0xF0D2, 0xE406, 0x7F07, 0xF800, 0x327B, 0xDB9C, 0x547A, 0xFCC2, 0x8835,
+    0x539A, 0x320D, 0xF492, 0xE6EC, 0x26BC, 0x6FC3, 0xA9C8, 0x00E9, 0xC11B,
+    0xD224, 0x199A, 0x2484, 0x1F47, 0xCE36, 0x2F14, 0x9972, 0x6801, 0x6C86,
+    0x5C33, 0x8274, 0x0E1F, 0xF5F6, 0x885F, 0x02B3, 0x9605, 0x39BC, 0xDBBD,
+    0x9E2D, 0xED7D, 0x5968, 0xE436, 0xA8DD, 0x1981, 0x5B9A, 0x93F4, 0x91D5,
+    0x4CBE, 0x5CFC, 0x8FC3, 0x1484, 0x101C, 0x4251, 0x17BF, 0xFB91, 0xF156,
+    0x0B4A, 0x2205, 0x949F, 0x1E4E, 0xC9F0, 0xB66C, 0xACCF, 0x5C44, 0xE3BB,
+    0x5BFD, 0xF3EC, 0xA47C, 0x6BC8, 0x46B3, 0xB5CD, 0xD223, 0x7022, 0x046F,
+    0xB7C8, 0x0B51, 0xD416, 0x5041, 0x95D1, 0xB7F0, 0x456F, 0xEC16, 0xE119,
+    0x8BD4, 0x43AD, 0xC04F, 0x16B2, 0x802D, 0xD7E2, 0x16AC, 0x833F, 0x1660,
+    0x993E, 0xD4F4, 0x9AC7, 0xE9A1, 0x12A5, 0x0504, 0x931E, 0xECC2, 0x157D,
+    0xE013, 0x8562, 0x8693, 0x9237, 0xD7F7, 0xC59D, 0xEAC2, 0x7CD0, 0xBA88,
+    0x5BD1, 0x09B5, 0x9C15, 0xACC0, 0xAA02, 0x0FDE, 0x434D, 0xE9E5, 0x8BE7,
+    0x601E, 0x8B55, 0x2E39, 0x1C1D, 0x0CDC, 0x1E81, 0xE405, 0x82AF, 0xF6C2,
+    0x53E9, 0x3E0A, 0x09DD, 0x173E, 0xA207, 0xD23D, 0x5DDF, 0x182E, 0x1A62,
+    0xC02E, 0xEDB9, 0x0D6A, 0x6687, 0x37B4, 0x1EDC, 0xEACD, 0xC515, 0x495B,
+    0x39B2, 0x9972, 0x9E49, 0xAC4E, 0xD364, 0x96B7, 0xBBB5, 0x412E, 0x8BB7,
+    0xA647, 0x3A9C, 0x93CF, 0x0AD3, 0x388C, 0x9C1C, 0x8268, 0x0BCD, 0xC814,
+    0x6521, 0x608A, 0x7120, 0xDBCA, 0xD2D0, 0xFA37, 0xC9A5, 0x56C8, 0x2066,
+    0xF8C9, 0x1872, 0x352B, 0x1908, 0x991E, 0xA478, 0xBA5C, 0x0E8C, 0x2486,
+    0xE293, 0x8D55, 0x2912, 0x2129
+)
+
+
+def derive_keys(seed_table):
+    """Build each block's 32-bit key from two 16-bit halves of the seed
+    table.
+    """
+    n = len(seed_table)
+    keys = {}
+    for b in range(n):
+        if (b ^ MIRROR_XOR) < n:
+            hi = seed_table[b]
+            lo = seed_table[b ^ MIRROR_XOR]
+            keys[b] = ((hi << 16) | lo) & UINT32_MAX
+    return keys
+
+
+BLOCK_KEYS = derive_keys(SEED_TABLE)
+DECRYPT_MAX = next(
+    b for b in range(len(BLOCK_KEYS) + 1) if b not in BLOCK_KEYS) * BLOCK
+
+
+def rotr(x, r):
+    r &= 31
+    x &= UINT32_MAX
+    return ((x >> r) | (x << (32 - r))) & UINT32_MAX if r else x
+
+
+def block_base(block):
+    """Per-block starting value of the keystream counter."""
+    return (block * A_MUL + block // 2) & UINT32_MAX
+
+
+def keystream(block, pos, block_key):
+    """Sequence of pseudorandom values to XOR against."""
+    counter = (block_base(block) + pos * STEP) & UINT32_MAX
+    mask = rotr(block_key, ROT * pos)
+    return counter ^ mask
+
+
+def decrypt_word(C, i):
+    """Undo per-block chaining, then cancel keystream."""
+    block, pos = i // BLOCK, i % BLOCK
+    dechained = C[i] if pos == 0 else C[i] ^ rotr(C[i - 1], 3)
+    return dechained ^ keystream(block, pos, BLOCK_KEYS[block])
+
+
+def encrypt_word(P, C, i):
+    """Apply keystream, then re-chain per block."""
+    block, pos = i // BLOCK, i % BLOCK
+    dechained = P[i] ^ keystream(block, pos, BLOCK_KEYS[block])
+    return dechained if pos == 0 else dechained ^ rotr(C[i - 1], 3)
+
+
+def decrypt_payload(C):
+    return [decrypt_word(C, i) for i in range(len(C))]
+
+
+def encrypt_payload(P, C_template):
+    if len(P) != len(C_template):
+        raise ValueError(
+            f"Payload length must match template ({len(C_template)} words)")
+    C = list(C_template)
+    for i in range(len(P)):
+        C[i] = encrypt_word(P, C, i)
+    return C
+
+
+def parse_sections(raw):
+    """Return list of data from concatenated 28-byte-header sections."""
+    secs = []
+    off = 0
+    while off + 28 <= len(raw):
+        version, addr, payload_len = struct.unpack(
+            "<III", raw[off:off + 12])
+        if payload_len <= 0 or off + 28 + payload_len > len(raw):
+            break
+        secs.append(dict(offset=off, id=version, addr=addr,
+                         payload_len=payload_len))
+        off += 28 + payload_len
+    return secs
+
+
+def words(payload):
+    n = len(payload) // 4
+    return list(struct.unpack(f"<{n}I", payload[:n * 4])), payload[n * 4:]
+
+
+def cmd_decrypt(args):
+    """Decrypt section 0 of a firmware to a standalone binary."""
+    raw = args.infile.read()
+    secs = parse_sections(raw)
+    if not secs:
+        raise SystemExit("No valid section header found")
+    sec = secs[0]
+    C, tail = words(
+        raw[sec["offset"] + 28:sec["offset"] + 28 + sec["payload_len"]])
+    n = len(C)
+    if n > DECRYPT_MAX:
+        sys.stderr.write(f"Warning: section 0 is {n} words but only "
+                         f"{DECRYPT_MAX} are decryptable\n")
+        n = DECRYPT_MAX
+    P = decrypt_payload(C[:n])
+    data = struct.pack(f"<{n}I", *P)
+    if n == len(C):
+        data += tail
+    args.output.write(data)
+    sys.stderr.write(f"Section 0: id={sec['id']} addr=0x{sec['addr']:08x} "
+                     f"payload_len={len(C) * 4}\n")
+    if len(secs) > 1:
+        others = ", ".join(f"0x{s['addr']:08x}" for s in secs[1:])
+        sys.stderr.write(
+            f"Ignored {len(secs) - 1} further section(s): {others}\n")
+    sys.stderr.write(f"Wrote {n} words ({len(data)} bytes)\n")
+
+
+def cmd_encrypt(args):
+    """Encrypt binary onto section 0 of a template firmware."""
+    template_raw = args.template.read()
+    secs = parse_sections(template_raw)
+    if not secs:
+        raise SystemExit("No valid section header found in template")
+    sec = secs[0]
+    base = sec["offset"] + 28
+    C_template, _ = words(template_raw[base:base + sec["payload_len"]])
+    raw_in = args.infile.read()
+    raw_in += b"\x00" * (-len(raw_in) % 4)
+    P, _ = words(raw_in)
+    if len(P) > len(C_template):
+        raise SystemExit(f"Payload ({len(P)} words) is longer than section 0 "
+                         f"({len(C_template)} words)")
+    pad = min(-len(P) % BLOCK, len(C_template) - len(P))
+    P = P + [0] * pad
+    C = encrypt_payload(P, C_template[:len(P)])
+    graft = template_raw[base + 4 * len(P):]
+    out = template_raw[:base] + struct.pack(f"<{len(C)}I", *C) + graft
+    args.output.write(out)
+    if pad:
+        sys.stderr.write(
+            f"Padded {pad} zero word(s) to reach block boundary\n")
+    sys.stderr.write(f"Re-encrypted {len(C)} words, {len(graft)} bytes left "
+                     f"from template\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="8CryptDo v1.0: 8BitDo firmware encryption tool",
+        epilog="GitHub: https://github.com/aeromodes/8cryptdo")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("decrypt", help=cmd_decrypt.__doc__,
+                       description=cmd_decrypt.__doc__)
+    d.add_argument("infile", type=argparse.FileType(
+        "rb"), help="Input .dat (- for stdin)")
+    d.add_argument("-o", "--output", type=argparse.FileType("wb"),
+                   default=sys.stdout.buffer,
+                   help="Output file (default: stdout)")
+    d.set_defaults(func=cmd_decrypt)
+    e = sub.add_parser("encrypt", help=cmd_encrypt.__doc__,
+                       description=cmd_encrypt.__doc__)
+    e.add_argument("template", type=argparse.FileType("rb"),
+                   help="Original firmware .dat to graft onto")
+    e.add_argument("infile", type=argparse.FileType("rb"),
+                   help="Payload to re-encrypt (- for stdin)")
+    e.add_argument("-o", "--output", type=argparse.FileType("wb"),
+                   default=sys.stdout.buffer,
+                   help="Output file (default: stdout)")
+    e.set_defaults(func=cmd_encrypt)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
+# vim: set textwidth=79:
