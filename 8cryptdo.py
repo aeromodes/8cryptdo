@@ -5,8 +5,8 @@
 
 Usage:
  - 8cryptdo.py decrypt in.dat [-s N] [-c gd32|yichip] -o out.bin
- - 8cryptdo.py encrypt template.dat payload.bin [-s N] [-c gd32|yichip]
-   -o new.dat
+ - 8cryptdo.py encrypt payload.bin -c gd32|yichip -v VERSION [-a ADDR]
+   [-l LENGTH] [-p PID] [--append] -o out.dat
 
 GitHub: https://github.com/aeromodes/8cryptdo
 """
@@ -69,6 +69,7 @@ class Cipher:
     MASK_ROT = 0
     MIRROR_XOR = 0xF9
     MAX_BLOCKS = 0
+    BASE_ADDR = 0
 
     def block_base(self, block):
         """Per-block starting value of the keystream counter."""
@@ -92,6 +93,7 @@ class GD32(Cipher):
     MASK_ROT = 18
     A_MUL = 0x80000301
     MAX_BLOCKS = len(SEED_TABLE)
+    BASE_ADDR = 0x08003400
 
     def block_base(self, block):
         return (block * self.A_MUL + block // 2) & UINT32_MAX
@@ -109,6 +111,7 @@ class Yichip(Cipher):
     INDEX_XOR = ((0x00, 0x82, 0x83, 0x81, 0x03, 0x81, 0x83, 0x81),
                  (0x86, 0x83, 0x81, 0x82, 0x03, 0x05, 0x82, 0x82))
     MAX_BLOCKS = math.inf
+    BASE_ADDR = 0x01018000
 
     def block_base(self, block):
         return (block * self.A_MUL + (block >> 8)) & UINT32_MAX
@@ -144,13 +147,10 @@ def decrypt_payload(C, cipher):
     return [decrypt_word(C, i, cipher) for i in range(len(C))]
 
 
-def encrypt_payload(P, C_template, cipher):
-    if len(P) != len(C_template):
-        raise ValueError(
-            f"Payload length must match template ({len(C_template)} words)")
-    C = list(C_template)
+def encrypt_payload(P, cipher):
+    C = []
     for i in range(len(P)):
-        C[i] = encrypt_word(P, C, i, cipher)
+        C.append(encrypt_word(P, C, i, cipher))
     return C
 
 
@@ -177,6 +177,15 @@ def select_section(raw, index):
         raise SystemExit(
             f"Section {index} not found ({len(secs)} section(s))")
     return secs, secs[index]
+
+
+def read_image(f):
+    """Read an image, verifying no bytes are left over."""
+    raw = f.read()
+    secs = parse_sections(raw)
+    if sum(28 + s["payload_len"] for s in secs) != len(raw):
+        raise SystemExit(f"{f.name} is not a valid image")
+    return len(secs)
 
 
 def words(payload):
@@ -210,33 +219,51 @@ def cmd_decrypt(args):
 
 
 def cmd_encrypt(args):
-    """Encrypt binary onto one section of a template firmware."""
-    template_raw = args.template.read()
-    _, sec = select_section(template_raw, args.section)
+    """Encrypt binary into a new firmware section."""
     cipher = CIPHERS[args.cipher]
-    base = sec["offset"] + 28
-    C_template, _ = words(template_raw[base:base + sec["payload_len"]])
     raw_in = args.infile.read()
-    raw_in += b"\x00" * (-len(raw_in) % 4)
-    P, _ = words(raw_in)
-    if len(P) > len(C_template):
-        raise SystemExit(f"Payload ({len(P)} words) is longer than section "
-                         f"{args.section} ({len(C_template)} words)")
-    if len(P) > cipher.MAX_BLOCKS * BLOCK:
-        raise SystemExit(f"Payload ({len(P)} words) is longer than "
+    length = args.length
+    if length is None:
+        length = len(raw_in) + -len(raw_in) % (BLOCK * 4)
+    if len(raw_in) > length:
+        raise SystemExit(f"Payload ({len(raw_in)} bytes) is longer than "
+                         f"length ({length} bytes)")
+    if length == 0 or length % (BLOCK * 4):
+        raise SystemExit(f"Length ({length} bytes) is not a positive "
+                         f"multiple of the block size ({BLOCK * 4} bytes)")
+    if length > cipher.MAX_BLOCKS * BLOCK * 4:
+        raise SystemExit(f"Length ({length} bytes) is longer than "
                          f"{args.cipher} can encrypt "
-                         f"({cipher.MAX_BLOCKS * BLOCK} words)")
-    pad = min(-len(P) % BLOCK, len(C_template) - len(P))
-    P = P + [0] * pad
-    C = encrypt_payload(P, C_template[:len(P)], cipher)
-    graft = template_raw[base + 4 * len(P):]
-    out = template_raw[:base] + struct.pack(f"<{len(C)}I", *C) + graft
-    args.output.write(out)
+                         f"({cipher.MAX_BLOCKS * BLOCK * 4} bytes)")
+    pad = length - len(raw_in)
+    P, _ = words(raw_in + b"\xff" * pad)
+    C = encrypt_payload(P, cipher)
+    addr = cipher.BASE_ADDR if args.addr is None else args.addr
+    header = struct.pack("<IIII", args.version, addr, length, args.pid)
+    section = header + bytes(12) + struct.pack(f"<{len(C)}I", *C)
+    index = 0
+    if args.output == "-":
+        sys.stdout.buffer.write(section)
+    elif args.append:
+        with open(args.output, "a+b") as f:
+            f.seek(0)
+            index = read_image(f)
+            f.write(section)
+    else:
+        with open(args.output, "wb") as f:
+            f.write(section)
     if pad:
-        sys.stderr.write(
-            f"Padded {pad} zero word(s) to reach block boundary\n")
-    sys.stderr.write(f"Re-encrypted {len(C)} words using {args.cipher}, "
-                     f"{len(graft)} bytes left from template\n")
+        sys.stderr.write(f"Padded {pad} byte(s) with 0xFF\n")
+    sys.stderr.write(f"Encrypted {len(C)} words using {args.cipher} as "
+                     f"section {index}: id={args.version} addr=0x{addr:08x} "
+                     f"pid=0x{args.pid:04x} payload_len={length}\n")
+
+
+def u32(s):
+    value = int(s, 0)
+    if not 0 <= value <= UINT32_MAX:
+        raise argparse.ArgumentTypeError(f"{s} does not fit in 32 bits")
+    return value
 
 
 def main():
@@ -258,16 +285,24 @@ def main():
     d.set_defaults(func=cmd_decrypt)
     e = sub.add_parser("encrypt", help=cmd_encrypt.__doc__,
                        description=cmd_encrypt.__doc__)
-    e.add_argument("template", type=argparse.FileType("rb"),
-                   help="Original firmware .dat to graft onto")
     e.add_argument("infile", type=argparse.FileType("rb"),
-                   help="Payload to re-encrypt (- for stdin)")
-    e.add_argument("-s", "--section", type=int, default=0,
-                   help="Section index (default: 0)")
-    e.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
-                   help="Cipher (default: gd32)")
-    e.add_argument("-o", "--output", type=argparse.FileType("wb"),
-                   default=sys.stdout.buffer,
+                   help="Payload to encrypt (- for stdin)")
+    e.add_argument("-c", "--cipher", choices=CIPHERS, required=True,
+                   help="Cipher")
+    e.add_argument("-v", "--version", type=u32, required=True,
+                   help="Firmware version (e.g. 108 for v1.08)")
+    e.add_argument("-a", "--addr", type=u32,
+                   help="Base address (default: " + ", ".join(
+                       f"0x{c.BASE_ADDR:08x} for {name}"
+                       for name, c in CIPHERS.items()) + ")")
+    e.add_argument("-l", "--length", type=u32,
+                   help="Payload length, padded with 0xFF "
+                   "(default: input length, rounded)")
+    e.add_argument("-p", "--pid", type=u32, default=0,
+                   help="Target USB PID (default: 0)")
+    e.add_argument("--append", action="store_true",
+                   help="Append to the output file instead of overwriting")
+    e.add_argument("-o", "--output", default="-",
                    help="Output file (default: stdout)")
     e.set_defaults(func=cmd_encrypt)
     args = ap.parse_args()
