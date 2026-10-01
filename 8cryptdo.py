@@ -4,8 +4,8 @@
 """8CryptDo v1.1: 8BitDo firmware encryption tool
 
 Usage:
- - 8cryptdo.py decrypt in.dat -o out.bin
- - 8cryptdo.py encrypt template.dat payload.bin -o new.dat
+ - 8cryptdo.py decrypt in.dat [-c gd32|yichip] -o out.bin
+ - 8cryptdo.py encrypt template.dat payload.bin [-c gd32|yichip] -o new.dat
 
 GitHub: https://github.com/aeromodes/8cryptdo
 """
@@ -13,14 +13,11 @@ GitHub: https://github.com/aeromodes/8cryptdo
 import sys
 import struct
 import argparse
+import math
 
 UINT32_MAX = 0xFFFFFFFF
 
-STEP = 0x92A753FA
-A_MUL = 0x80000301
-ROT = 18
 BLOCK = 128
-MIRROR_XOR = 0xF9
 
 SEED_TABLE = (
     0xF428, 0x50C3, 0x3071, 0x722A, 0x848D, 0x0DD7, 0x5B3E, 0x56EF, 0x3AD3,
@@ -55,68 +52,104 @@ SEED_TABLE = (
 )
 
 
-def derive_keys(seed_table):
-    """Build each block's 32-bit key from two 16-bit halves of the seed
-    table.
-    """
-    n = len(seed_table)
-    keys = {}
-    for b in range(n):
-        if (b ^ MIRROR_XOR) < n:
-            hi = seed_table[b]
-            lo = seed_table[b ^ MIRROR_XOR]
-            keys[b] = ((hi << 16) | lo) & UINT32_MAX
-    return keys
-
-
-BLOCK_KEYS = derive_keys(SEED_TABLE)
-DECRYPT_MAX = next(
-    b for b in range(len(BLOCK_KEYS) + 1) if b not in BLOCK_KEYS) * BLOCK
-
-
 def rotr(x, r):
     r &= 31
     x &= UINT32_MAX
     return ((x >> r) | (x << (32 - r))) & UINT32_MAX if r else x
 
 
-def block_base(block):
-    """Per-block starting value of the keystream counter."""
-    return (block * A_MUL + block // 2) & UINT32_MAX
+class Cipher:
+    """Keystream XOR on 32-bit words, with chaining that resets every
+    BLOCK words.
+    """
+    NAME = ""
+    STEP = 0
+    CHAIN_ROT = 0
+    MASK_ROT = 0
+    MIRROR_XOR = 0xF9
+    MAX_BLOCKS = 0
+
+    def block_base(self, block):
+        """Per-block starting value of the keystream counter."""
+        raise NotImplementedError
+
+    def block_key(self, block):
+        """Build a block's 32-bit key from two 16-bit seed table entries."""
+        raise NotImplementedError
+
+    def keystream(self, block, pos):
+        """Sequence of pseudorandom values to XOR against."""
+        counter = (self.block_base(block) + pos * self.STEP) & UINT32_MAX
+        mask = rotr(self.block_key(block), self.MASK_ROT * pos)
+        return counter ^ mask
 
 
-def keystream(block, pos, block_key):
-    """Sequence of pseudorandom values to XOR against."""
-    counter = (block_base(block) + pos * STEP) & UINT32_MAX
-    mask = rotr(block_key, ROT * pos)
-    return counter ^ mask
+class GD32(Cipher):
+    NAME = "gd32"
+    STEP = 0x92A753FA
+    CHAIN_ROT = 3
+    MASK_ROT = 18
+    A_MUL = 0x80000301
+    MAX_BLOCKS = len(SEED_TABLE)
+
+    def block_base(self, block):
+        return (block * self.A_MUL + block // 2) & UINT32_MAX
+
+    def block_key(self, block):
+        return (SEED_TABLE[block] << 16) | SEED_TABLE[block ^ self.MIRROR_XOR]
 
 
-def decrypt_word(C, i):
+class Yichip(Cipher):
+    NAME = "yichip"
+    STEP = 0xEE97FAFA
+    CHAIN_ROT = 18
+    MASK_ROT = 16
+    A_MUL = 0x01200210
+    INDEX_XOR = ((0x00, 0x82, 0x83, 0x81, 0x03, 0x81, 0x83, 0x81),
+                 (0x86, 0x83, 0x81, 0x82, 0x03, 0x05, 0x82, 0x82))
+    MAX_BLOCKS = math.inf
+
+    def block_base(self, block):
+        return (block * self.A_MUL + (block >> 8)) & UINT32_MAX
+
+    def seed_index(self, e):
+        return e ^ self.INDEX_XOR[e >> 7][e & 7]
+
+    def block_key(self, block):
+        e = (block + (block >> 8)) & 0xFF
+        return (SEED_TABLE[self.seed_index(e)] << 16) | \
+            SEED_TABLE[self.seed_index(e ^ self.MIRROR_XOR)]
+
+
+CIPHERS = {c.NAME: c for c in (GD32(), Yichip())}
+
+
+def decrypt_word(C, i, cipher):
     """Undo per-block chaining, then cancel keystream."""
     block, pos = i // BLOCK, i % BLOCK
-    dechained = C[i] if pos == 0 else C[i] ^ rotr(C[i - 1], 3)
-    return dechained ^ keystream(block, pos, BLOCK_KEYS[block])
+    dechained = C[i] if pos == 0 else C[i] ^ rotr(C[i - 1], cipher.CHAIN_ROT)
+    return dechained ^ cipher.keystream(block, pos)
 
 
-def encrypt_word(P, C, i):
+def encrypt_word(P, C, i, cipher):
     """Apply keystream, then re-chain per block."""
     block, pos = i // BLOCK, i % BLOCK
-    dechained = P[i] ^ keystream(block, pos, BLOCK_KEYS[block])
-    return dechained if pos == 0 else dechained ^ rotr(C[i - 1], 3)
+    dechained = P[i] ^ cipher.keystream(block, pos)
+    return dechained if pos == 0 else \
+        dechained ^ rotr(C[i - 1], cipher.CHAIN_ROT)
 
 
-def decrypt_payload(C):
-    return [decrypt_word(C, i) for i in range(len(C))]
+def decrypt_payload(C, cipher):
+    return [decrypt_word(C, i, cipher) for i in range(len(C))]
 
 
-def encrypt_payload(P, C_template):
+def encrypt_payload(P, C_template, cipher):
     if len(P) != len(C_template):
         raise ValueError(
             f"Payload length must match template ({len(C_template)} words)")
     C = list(C_template)
     for i in range(len(P)):
-        C[i] = encrypt_word(P, C, i)
+        C[i] = encrypt_word(P, C, i, cipher)
     return C
 
 
@@ -147,14 +180,16 @@ def cmd_decrypt(args):
     if not secs:
         raise SystemExit("No valid section header found")
     sec = secs[0]
+    cipher = CIPHERS[args.cipher]
     C, tail = words(
         raw[sec["offset"] + 28:sec["offset"] + 28 + sec["payload_len"]])
     n = len(C)
-    if n > DECRYPT_MAX:
+    decrypt_max = cipher.MAX_BLOCKS * BLOCK
+    if n > decrypt_max:
         sys.stderr.write(f"Warning: section 0 is {n} words but only "
-                         f"{DECRYPT_MAX} are decryptable\n")
-        n = DECRYPT_MAX
-    P = decrypt_payload(C[:n])
+                         f"{decrypt_max} are decryptable\n")
+        n = decrypt_max
+    P = decrypt_payload(C[:n], cipher)
     data = struct.pack(f"<{n}I", *P)
     if n == len(C):
         data += tail
@@ -165,7 +200,8 @@ def cmd_decrypt(args):
         others = ", ".join(f"0x{s['addr']:08x}" for s in secs[1:])
         sys.stderr.write(
             f"Ignored {len(secs) - 1} further section(s): {others}\n")
-    sys.stderr.write(f"Wrote {n} words ({len(data)} bytes)\n")
+    sys.stderr.write(f"Wrote {n} words ({len(data)} bytes) using "
+                     f"{args.cipher}\n")
 
 
 def cmd_encrypt(args):
@@ -175,6 +211,7 @@ def cmd_encrypt(args):
     if not secs:
         raise SystemExit("No valid section header found in template")
     sec = secs[0]
+    cipher = CIPHERS[args.cipher]
     base = sec["offset"] + 28
     C_template, _ = words(template_raw[base:base + sec["payload_len"]])
     raw_in = args.infile.read()
@@ -183,17 +220,21 @@ def cmd_encrypt(args):
     if len(P) > len(C_template):
         raise SystemExit(f"Payload ({len(P)} words) is longer than section 0 "
                          f"({len(C_template)} words)")
+    if len(P) > cipher.MAX_BLOCKS * BLOCK:
+        raise SystemExit(f"Payload ({len(P)} words) is longer than "
+                         f"{args.cipher} can encrypt "
+                         f"({cipher.MAX_BLOCKS * BLOCK} words)")
     pad = min(-len(P) % BLOCK, len(C_template) - len(P))
     P = P + [0] * pad
-    C = encrypt_payload(P, C_template[:len(P)])
+    C = encrypt_payload(P, C_template[:len(P)], cipher)
     graft = template_raw[base + 4 * len(P):]
     out = template_raw[:base] + struct.pack(f"<{len(C)}I", *C) + graft
     args.output.write(out)
     if pad:
         sys.stderr.write(
             f"Padded {pad} zero word(s) to reach block boundary\n")
-    sys.stderr.write(f"Re-encrypted {len(C)} words, {len(graft)} bytes left "
-                     f"from template\n")
+    sys.stderr.write(f"Re-encrypted {len(C)} words using {args.cipher}, "
+                     f"{len(graft)} bytes left from template\n")
 
 
 def main():
@@ -205,6 +246,8 @@ def main():
                        description=cmd_decrypt.__doc__)
     d.add_argument("infile", type=argparse.FileType(
         "rb"), help="Input .dat (- for stdin)")
+    d.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
+                   help="Cipher (default: gd32)")
     d.add_argument("-o", "--output", type=argparse.FileType("wb"),
                    default=sys.stdout.buffer,
                    help="Output file (default: stdout)")
@@ -215,6 +258,8 @@ def main():
                    help="Original firmware .dat to graft onto")
     e.add_argument("infile", type=argparse.FileType("rb"),
                    help="Payload to re-encrypt (- for stdin)")
+    e.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
+                   help="Cipher (default: gd32)")
     e.add_argument("-o", "--output", type=argparse.FileType("wb"),
                    default=sys.stdout.buffer,
                    help="Output file (default: stdout)")
