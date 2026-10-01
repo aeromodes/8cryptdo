@@ -4,12 +4,13 @@
 """8CryptDo v1.1: 8BitDo firmware encryption tool
 
 Usage:
- - cryptdo8.py decrypt in.dat [-s N] [-c gd32|yichip] -o out.bin
+ - cryptdo8.py decrypt in.dat [-s N] [-c auto|gd32|yichip] -o out.bin
  - cryptdo8.py encrypt payload.bin -c gd32|yichip -v VERSION [-a ADDR]
    [-l LENGTH] [-p PID] [--append] -o out.dat
 
 As a module:
  - parse_sections(): list the sections of an image
+ - detect_cipher(): find the cipher a section uses
  - decrypt_section(): decrypt a section to plaintext
  - build_section(): encrypt a payload into a section
 
@@ -20,6 +21,7 @@ import sys
 import struct
 import argparse
 import math
+from collections import Counter
 
 UINT32_MAX = 0xFFFFFFFF
 
@@ -207,6 +209,22 @@ def decrypt_section(raw, sec, cipher):
     return data + tail if n == len(C) else data
 
 
+def entropy(data):
+    """Shannon entropy in bits per byte."""
+    n = len(data)
+    return -sum(c / n * math.log2(c / n) for c in Counter(data).values())
+
+
+def detect_cipher(raw, sec, sample=8192):
+    """Find the cipher whose output looks like plaintext, if exactly one
+    does.
+    """
+    head = dict(sec, payload_len=min(sec["payload_len"], sample))
+    found = [cipher for cipher in CIPHERS.values()
+             if entropy(decrypt_section(raw, head, cipher)) < 7.5]
+    return found[0] if len(found) == 1 else None
+
+
 def build_section(payload, cipher, version, addr=None, length=None, pid=0):
     """Encrypt a payload into a section, header included."""
     if length is None:
@@ -234,7 +252,13 @@ def cmd_decrypt(args):
     """Decrypt one section of a firmware to a standalone binary."""
     raw = args.infile.read()
     secs, sec = select_section(raw, args.section)
-    data = decrypt_section(raw, sec, CIPHERS[args.cipher])
+    if args.cipher == "auto":
+        cipher = detect_cipher(raw, sec)
+        if cipher is None:
+            raise ValueError("Could not detect the cipher, select one with -c")
+    else:
+        cipher = CIPHERS[args.cipher]
+    data = decrypt_section(raw, sec, cipher)
     args.output.write(data)
     if len(data) < sec["payload_len"]:
         sys.stderr.write(f"Warning: section {args.section} is "
@@ -244,7 +268,7 @@ def cmd_decrypt(args):
                      f"addr=0x{sec['addr']:08x} pid=0x{sec['pid']:04x} "
                      f"payload_len={sec['payload_len']}\n")
     sys.stderr.write(f"Wrote {len(data) // 4} words ({len(data)} bytes) "
-                     f"using {args.cipher}\n")
+                     f"using {cipher.NAME}\n")
 
 
 def cmd_encrypt(args):
@@ -294,8 +318,8 @@ def main():
         "rb"), help="Input .dat (- for stdin)")
     d.add_argument("-s", "--section", type=int, default=0,
                    help="Section index (default: 0)")
-    d.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
-                   help="Cipher (default: gd32)")
+    d.add_argument("-c", "--cipher", choices=["auto", *CIPHERS],
+                   default="auto", help="Cipher (default: auto)")
     d.add_argument("-o", "--output", type=argparse.FileType("wb"),
                    default=sys.stdout.buffer,
                    help="Output file (default: stdout)")
