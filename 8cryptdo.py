@@ -4,8 +4,9 @@
 """8CryptDo v1.1: 8BitDo firmware encryption tool
 
 Usage:
- - 8cryptdo.py decrypt in.dat [-c gd32|yichip] -o out.bin
- - 8cryptdo.py encrypt template.dat payload.bin [-c gd32|yichip] -o new.dat
+ - 8cryptdo.py decrypt in.dat [-s N] [-c gd32|yichip] -o out.bin
+ - 8cryptdo.py encrypt template.dat payload.bin [-s N] [-c gd32|yichip]
+   -o new.dat
 
 GitHub: https://github.com/aeromodes/8cryptdo
 """
@@ -168,49 +169,49 @@ def parse_sections(raw):
     return secs
 
 
+def select_section(raw, index):
+    secs = parse_sections(raw)
+    if not secs:
+        raise SystemExit("No valid section header found")
+    if not 0 <= index < len(secs):
+        raise SystemExit(
+            f"Section {index} not found ({len(secs)} section(s))")
+    return secs, secs[index]
+
+
 def words(payload):
     n = len(payload) // 4
     return list(struct.unpack(f"<{n}I", payload[:n * 4])), payload[n * 4:]
 
 
 def cmd_decrypt(args):
-    """Decrypt section 0 of a firmware to a standalone binary."""
+    """Decrypt one section of a firmware to a standalone binary."""
     raw = args.infile.read()
-    secs = parse_sections(raw)
-    if not secs:
-        raise SystemExit("No valid section header found")
-    sec = secs[0]
+    secs, sec = select_section(raw, args.section)
     cipher = CIPHERS[args.cipher]
     C, tail = words(
         raw[sec["offset"] + 28:sec["offset"] + 28 + sec["payload_len"]])
     n = len(C)
     decrypt_max = cipher.MAX_BLOCKS * BLOCK
     if n > decrypt_max:
-        sys.stderr.write(f"Warning: section 0 is {n} words but only "
-                         f"{decrypt_max} are decryptable\n")
+        sys.stderr.write(f"Warning: section {args.section} is {n} words but "
+                         f"only {decrypt_max} are decryptable\n")
         n = decrypt_max
     P = decrypt_payload(C[:n], cipher)
     data = struct.pack(f"<{n}I", *P)
     if n == len(C):
         data += tail
     args.output.write(data)
-    sys.stderr.write(f"Section 0: id={sec['id']} addr=0x{sec['addr']:08x} "
-                     f"payload_len={len(C) * 4}\n")
-    if len(secs) > 1:
-        others = ", ".join(f"0x{s['addr']:08x}" for s in secs[1:])
-        sys.stderr.write(
-            f"Ignored {len(secs) - 1} further section(s): {others}\n")
+    sys.stderr.write(f"Section {args.section}/{len(secs) - 1}: id={sec['id']} "
+                     f"addr=0x{sec['addr']:08x} payload_len={len(C) * 4}\n")
     sys.stderr.write(f"Wrote {n} words ({len(data)} bytes) using "
                      f"{args.cipher}\n")
 
 
 def cmd_encrypt(args):
-    """Encrypt binary onto section 0 of a template firmware."""
+    """Encrypt binary onto one section of a template firmware."""
     template_raw = args.template.read()
-    secs = parse_sections(template_raw)
-    if not secs:
-        raise SystemExit("No valid section header found in template")
-    sec = secs[0]
+    _, sec = select_section(template_raw, args.section)
     cipher = CIPHERS[args.cipher]
     base = sec["offset"] + 28
     C_template, _ = words(template_raw[base:base + sec["payload_len"]])
@@ -218,8 +219,8 @@ def cmd_encrypt(args):
     raw_in += b"\x00" * (-len(raw_in) % 4)
     P, _ = words(raw_in)
     if len(P) > len(C_template):
-        raise SystemExit(f"Payload ({len(P)} words) is longer than section 0 "
-                         f"({len(C_template)} words)")
+        raise SystemExit(f"Payload ({len(P)} words) is longer than section "
+                         f"{args.section} ({len(C_template)} words)")
     if len(P) > cipher.MAX_BLOCKS * BLOCK:
         raise SystemExit(f"Payload ({len(P)} words) is longer than "
                          f"{args.cipher} can encrypt "
@@ -246,6 +247,8 @@ def main():
                        description=cmd_decrypt.__doc__)
     d.add_argument("infile", type=argparse.FileType(
         "rb"), help="Input .dat (- for stdin)")
+    d.add_argument("-s", "--section", type=int, default=0,
+                   help="Section index (default: 0)")
     d.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
                    help="Cipher (default: gd32)")
     d.add_argument("-o", "--output", type=argparse.FileType("wb"),
@@ -258,6 +261,8 @@ def main():
                    help="Original firmware .dat to graft onto")
     e.add_argument("infile", type=argparse.FileType("rb"),
                    help="Payload to re-encrypt (- for stdin)")
+    e.add_argument("-s", "--section", type=int, default=0,
+                   help="Section index (default: 0)")
     e.add_argument("-c", "--cipher", choices=CIPHERS, default="gd32",
                    help="Cipher (default: gd32)")
     e.add_argument("-o", "--output", type=argparse.FileType("wb"),
