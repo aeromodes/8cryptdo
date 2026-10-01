@@ -3,15 +3,15 @@
 
 # 8CryptDo
 
-Reverse-engineered documentation and tooling for the firmware encryption used by
-8BitDo for several GD32-based products.
+Reverse-engineered documentation and tooling for the firmware encryption methods
+used by 8BitDo for several products.
 
-See `cryptdo8.py` for a decryption and re-encryption tool applying the algorithm
-described in this document.
+See `cryptdo8.py` for a decryption and re-encryption tool applying the
+algorithms described in this document.
 
-The tool potentially enables the possibility to create customized firmware.
-However, this repository does not include any of the official firmware data. A
-script to download the latest firmware files can be found at the
+The tool potentially enables creating customized firmware. However, this
+repository does not include any of the official firmware data. A script to
+download the latest firmware files can be found at the
 [fwupd/8bitdo-firmware](https://github.com/fwupd/8bitdo-firmware) repository,
 with some older firmware binaries archived.
 
@@ -23,15 +23,17 @@ present.
 ```python
 import struct
 
-raw = open("sn30-v2_07.dat", "rb").read()
-version, addr, payload_len = struct.unpack("<III", raw[:12])
+raw = open("sn30.dat", "rb").read()
+version, addr, payload_len, pid = struct.unpack("<IIII", raw[:16])
 # version     = 207        -> firmware == v2.07
 # addr        = 0x08003400 -> destination (probably)
 # payload_len = 99328      -> section payload length in bytes
+# pid         = 0x0000     -> (optional, usually 0) USB PID
 ```
 
-With recent firmware files there is an unknown 32-bit value placed after these.
-The rest of the header is zero.
+The rest of the header is zero. After seeking the payload length within the
+file, another header and more firmware data may be present. We can refer to
+these as firmware "sections." For now, we will only focus on the first section.
 
 ## Keyless chaining layer
 
@@ -90,8 +92,7 @@ security of their cipher and made the rest of the analysis here possible.
 ## Reading the keystream
 
 Once you know two plaintexts are XOR-ed together, you can guess part of one and
-subtract your guess to read the other. This recovers the `keystream` at that
-spot.
+XOR out your guess to read the other. This recovers the keystream at that spot.
 
 ```python
 keystream[i] = dechained[i] ^ P[i]
@@ -106,13 +107,13 @@ version, you can line the shared code up in another and harvest new keystream
 values.
 
 Exploiting this took the known keystream words from ~1,500 to several thousand,
-roughly 18% of the firmware readable.
+making roughly 18% of the firmware readable.
 
 ## Keystream rule
 
-With a larger sample of the `keystream`, patterns became visible. It had
-positions 16 words apart that stepped by an almost constant amount, and each
-byte moved by a predictable size.
+With a larger sample of the keystream, patterns became visible: positions 16
+words apart that stepped by an almost constant amount, and bytes that moved by a
+predictable size.
 
 Through trial and error, it was discovered that every keystream word in a block
 follows a formula:
@@ -121,7 +122,7 @@ follows a formula:
 STEP  = 0x92A753FA
 A_MUL = 0x80000301
 ROT   = 18
-UINT32_MAX  = 0xFFFFFFFF
+UINT32_MAX = 0xFFFFFFFF
 
 def rotr(x, r):
     r &= 31
@@ -136,12 +137,12 @@ def keystream(block, pos, block_key):
     return counter ^ mask
 ```
 
-Within a block, walk a simple counter (`block_base(block) + pos*STEP`), and XOR
-it with a mask that starts at `block_key` and rotates 18 bits every step. The
-entire 128-word block is determined by one 32-bit number, `block_key`.
+The entire 128-word block is determined by one 32-bit number: its "block key."
+Within a block, walk a simple counter (`block_base(block) + pos * STEP`), and
+XOR it with a mask that starts at the block key and rotates 18 bits every step.
 
-One known word unlocks a whole block. Rearranging the formula gives the
-`block_key` from any known keystream word:
+Therefore, one known word unlocks a whole block. Rearranging the formula gives
+the block key from any known keystream word:
 
 ```python
 def block_key_from_known(block, pos, known_keystream):
@@ -161,7 +162,7 @@ def block_key_of(block, seed_table):
     return (hi << 16) | lo
 ```
 
-The seed table itself appears to have no specific formula, it's probably 512
+The seed table itself appears to have no specific formula; it's probably 512
 constant bytes stored somewhere in the bootloader of each device. However, the
 XOR with `0xF9` provides a beautiful side effect: a *mirror law*. A block and
 its partner `block ^ 0xF9` are built from the same two table entries swapped.
@@ -171,24 +172,62 @@ mirror = block_key_of(block ^ 0xF9, seed_table)
 assert mirror == rotr(block_key_of(block, seed_table), 16)
 ```
 
-This cracked previously unknown regions. Instead of guessing a full 32-bit
-`block_key` blind, you can guess two 16-bit halves and score which choice turns
-both blocks into believable strings or ARM instructions.
+This cracked previously unknown regions. Instead of guessing a full block key
+blind, you can guess two 16-bit halves and score which choice turns both blocks
+into believable strings or ARM instructions.
 
 With that, 100% coverage of all firmware data using this specific cipher was
 obtained.
 
-## Remaining work
+## Yichip cipher
 
-This cipher seems to cover most 8BitDo products circa 2020, and current products
-that still use GD32 SoCs (including the SN30 Pro).
+The above cipher seems to be present on most GD32 devices from 8BitDo, so I've
+dubbed it the "GD32 cipher."
 
-Some devices like the M30 and Zero 2 appear to be multi-section, with some
-firmware data using this cipher and another firmware with a different encryption
-scheme.
+There is a newer cipher used consistently by 8BitDo. Products using this cipher
+include most of the Ultimate/Pro line, the M30, and the Zero 2, to name a few.
+The latter two seem to have multiple sections in their firmware files: the first
+being encoded with the older GD32 cipher, and the second with this new cipher.
 
-Newer devices, at least those with a different SoC, seem to have a stronger
-firmware encryption scheme. Some naïve analysis shows it may potentially be
-shared, but unsure. Need to investigate that further.
+After lots of experimentation, I discovered that this cipher isn't totally new.
+It's actually a *variant* of the existing GD32 cipher with modified parameters:
+
+```python
+CHAIN_ROT = 18          # GD32: 3
+STEP      = 0xEE97FAFA  # GD32: 0x92A753FA
+A_MUL     = 0x01200210  # GD32: 0x80000301
+ROT       = 16          # GD32: 18
+
+def block_base(block):
+    return (block * A_MUL + (block >> 8)) & UINT32_MAX
+```
+
+Notably, the block key is still built from an index and its `0xF9` partner, but
+each is first turned into a seed table index by XOR-ing it with a value from a
+small table. Here, `e` is the block's position in a 256-entry key schedule:
+
+```python
+INDEX_XOR = ((0x00, 0x82, 0x83, 0x81, 0x03, 0x81, 0x83, 0x81),
+             (0x86, 0x83, 0x81, 0x82, 0x03, 0x05, 0x82, 0x82))
+
+def seed_index(e):
+    return e ^ INDEX_XOR[e >> 7][e & 7]
+
+def block_key_of(block, seed_table):
+    e = (block + (block >> 8)) & 0xFF
+    hi = seed_table[seed_index(e)]
+    lo = seed_table[seed_index(e ^ 0xF9)]
+    return (hi << 16) | lo
+```
+
+The images decrypted appear to mostly be Yichip-based, judging by the SDK
+remnants. In fact, a teardown of a recent Zero 2 device showed that it
+specifically uses the YC3121. Therefore, I will dub this the "Yichip cipher."
+
+Unlike the GD32 cipher, the Yichip cipher isn't limited to 256 blocks. Every 256
+blocks, the schedule is wrapped: the counter base is increased by one (much like
+the `block // 2` term of the GD32 cipher) and the key index advances by one.
+This is shown in practice with early 64 BT builds, which span over 600 blocks
+and decrypt end to end.
 
 <!-- vim: set tw=80: -->

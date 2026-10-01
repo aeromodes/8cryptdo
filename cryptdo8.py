@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 AeroModes <mail@aeromod.es>
 # SPDX-License-Identifier: MIT
-"""8CryptDo v1.1: 8BitDo firmware encryption tool
+"""8CryptDo v2.0: 8BitDo firmware encryption tool
 
 Usage:
  - cryptdo8.py decrypt in.dat [-s N] [-c auto|gd32|yichip] -o out.bin
@@ -309,42 +309,43 @@ def u32(s):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="8CryptDo v1.1: 8BitDo firmware encryption tool",
+        description="8CryptDo v2.0: 8BitDo firmware encryption tool",
         epilog="GitHub: https://github.com/aeromodes/8cryptdo")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    d = sub.add_parser("decrypt", help=cmd_decrypt.__doc__,
-                       description=cmd_decrypt.__doc__)
+    d = sub.add_parser("decrypt", description=cmd_decrypt.__doc__,
+                       help="decrypt one section of a firmware to a "
+                       "standalone binary")
     d.add_argument("infile", type=argparse.FileType(
-        "rb"), help="Input .dat (- for stdin)")
+        "rb"), help="input .dat (- for stdin)")
     d.add_argument("-s", "--section", type=int, default=0,
-                   help="Section index (default: 0)")
+                   help="section index (default: 0)")
     d.add_argument("-c", "--cipher", choices=["auto", *CIPHERS],
-                   default="auto", help="Cipher (default: auto)")
+                   default="auto", help="cipher (default: auto)")
     d.add_argument("-o", "--output", type=argparse.FileType("wb"),
                    default=sys.stdout.buffer,
-                   help="Output file (default: stdout)")
+                   help="output file (default: stdout)")
     d.set_defaults(func=cmd_decrypt)
-    e = sub.add_parser("encrypt", help=cmd_encrypt.__doc__,
-                       description=cmd_encrypt.__doc__)
+    e = sub.add_parser("encrypt", description=cmd_encrypt.__doc__,
+                       help="encrypt binary into a new firmware section")
     e.add_argument("infile", type=argparse.FileType("rb"),
-                   help="Payload to encrypt (- for stdin)")
+                   help="payload to encrypt (- for stdin)")
     e.add_argument("-c", "--cipher", choices=CIPHERS, required=True,
-                   help="Cipher")
+                   help="cipher")
     e.add_argument("-v", "--version", type=u32, required=True,
-                   help="Firmware version (e.g. 108 for v1.08)")
+                   help="firmware version (e.g. 108 for v1.08)")
     e.add_argument("-a", "--addr", type=u32,
-                   help="Base address (default: " + ", ".join(
+                   help="base address (default: " + ", ".join(
                        f"0x{c.BASE_ADDR:08x} for {name}"
                        for name, c in CIPHERS.items()) + ")")
     e.add_argument("-l", "--length", type=u32,
-                   help="Payload length, padded with 0xFF "
+                   help="payload length, padded with 0xFF "
                    "(default: input length, rounded)")
     e.add_argument("-p", "--pid", type=u32, default=0,
-                   help="Target USB PID (default: 0)")
+                   help="target USB PID (default: 0)")
     e.add_argument("--append", action="store_true",
-                   help="Append to the output file instead of overwriting")
+                   help="append to the output file instead of overwriting")
     e.add_argument("-o", "--output", default="-",
-                   help="Output file (default: stdout)")
+                   help="output file (default: stdout)")
     e.set_defaults(func=cmd_encrypt)
     args = ap.parse_args()
     try:
