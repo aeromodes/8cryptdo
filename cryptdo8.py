@@ -4,9 +4,14 @@
 """8CryptDo v1.1: 8BitDo firmware encryption tool
 
 Usage:
- - 8cryptdo.py decrypt in.dat [-s N] [-c gd32|yichip] -o out.bin
- - 8cryptdo.py encrypt payload.bin -c gd32|yichip -v VERSION [-a ADDR]
+ - cryptdo8.py decrypt in.dat [-s N] [-c gd32|yichip] -o out.bin
+ - cryptdo8.py encrypt payload.bin -c gd32|yichip -v VERSION [-a ADDR]
    [-l LENGTH] [-p PID] [--append] -o out.dat
+
+As a module:
+ - parse_sections(): list the sections of an image
+ - decrypt_section(): decrypt a section to plaintext
+ - build_section(): encrypt a payload into a section
 
 GitHub: https://github.com/aeromodes/8cryptdo
 """
@@ -19,6 +24,7 @@ import math
 UINT32_MAX = 0xFFFFFFFF
 
 BLOCK = 128
+HEADER_SIZE = 28
 
 SEED_TABLE = (
     0xF428, 0x50C3, 0x3071, 0x722A, 0x848D, 0x0DD7, 0x5B3E, 0x56EF, 0x3AD3,
@@ -155,37 +161,36 @@ def encrypt_payload(P, cipher):
 
 
 def parse_sections(raw):
-    """Return list of data from concatenated 28-byte-header sections."""
+    """Parse the sections of an image, stopping at the first invalid one."""
     secs = []
     off = 0
-    while off + 28 <= len(raw):
+    while off + HEADER_SIZE <= len(raw):
         version, addr, payload_len, pid = struct.unpack(
             "<IIII", raw[off:off + 16])
-        if payload_len <= 0 or off + 28 + payload_len > len(raw):
+        if payload_len <= 0 or off + HEADER_SIZE + payload_len > len(raw):
             break
         secs.append(dict(offset=off, id=version, addr=addr,
                          payload_len=payload_len, pid=pid))
-        off += 28 + payload_len
+        off += HEADER_SIZE + payload_len
     return secs
 
 
 def select_section(raw, index):
     secs = parse_sections(raw)
     if not secs:
-        raise SystemExit("No valid section header found")
+        raise ValueError("No valid section header found")
     if not 0 <= index < len(secs):
-        raise SystemExit(
+        raise ValueError(
             f"Section {index} not found ({len(secs)} section(s))")
     return secs, secs[index]
 
 
-def read_image(f):
-    """Read an image, verifying no bytes are left over."""
-    raw = f.read()
+def parse_image(raw):
+    """Parse an image, verifying no bytes are left over."""
     secs = parse_sections(raw)
-    if sum(28 + s["payload_len"] for s in secs) != len(raw):
-        raise SystemExit(f"{f.name} is not a valid image")
-    return len(secs)
+    if sum(HEADER_SIZE + s["payload_len"] for s in secs) != len(raw):
+        raise ValueError("Not a valid image")
+    return secs
 
 
 def words(payload):
@@ -193,70 +198,82 @@ def words(payload):
     return list(struct.unpack(f"<{n}I", payload[:n * 4])), payload[n * 4:]
 
 
+def decrypt_section(raw, sec, cipher):
+    """Decrypt a section, stopping where the cipher's keys run out."""
+    start = sec["offset"] + HEADER_SIZE
+    C, tail = words(raw[start:start + sec["payload_len"]])
+    n = min(len(C), cipher.MAX_BLOCKS * BLOCK)
+    data = struct.pack(f"<{n}I", *decrypt_payload(C[:n], cipher))
+    return data + tail if n == len(C) else data
+
+
+def build_section(payload, cipher, version, addr=None, length=None, pid=0):
+    """Encrypt a payload into a section, header included."""
+    if length is None:
+        length = len(payload) + -len(payload) % (BLOCK * 4)
+    if len(payload) > length:
+        raise ValueError(f"Payload ({len(payload)} bytes) is longer than "
+                         f"length ({length} bytes)")
+    if length == 0 or length % (BLOCK * 4):
+        raise ValueError(f"Length ({length} bytes) is not a positive "
+                         f"multiple of the block size ({BLOCK * 4} bytes)")
+    if length > cipher.MAX_BLOCKS * BLOCK * 4:
+        raise ValueError(f"Length ({length} bytes) is longer than "
+                         f"{cipher.NAME} can encrypt "
+                         f"({cipher.MAX_BLOCKS * BLOCK * 4} bytes)")
+    if addr is None:
+        addr = cipher.BASE_ADDR
+    P, _ = words(payload + b"\xff" * (length - len(payload)))
+    C = encrypt_payload(P, cipher)
+    header = struct.pack("<IIII", version, addr, length, pid)
+    return header + bytes(HEADER_SIZE - len(header)) + \
+        struct.pack(f"<{len(C)}I", *C)
+
+
 def cmd_decrypt(args):
     """Decrypt one section of a firmware to a standalone binary."""
     raw = args.infile.read()
     secs, sec = select_section(raw, args.section)
-    cipher = CIPHERS[args.cipher]
-    C, tail = words(
-        raw[sec["offset"] + 28:sec["offset"] + 28 + sec["payload_len"]])
-    n = len(C)
-    decrypt_max = cipher.MAX_BLOCKS * BLOCK
-    if n > decrypt_max:
-        sys.stderr.write(f"Warning: section {args.section} is {n} words but "
-                         f"only {decrypt_max} are decryptable\n")
-        n = decrypt_max
-    P = decrypt_payload(C[:n], cipher)
-    data = struct.pack(f"<{n}I", *P)
-    if n == len(C):
-        data += tail
+    data = decrypt_section(raw, sec, CIPHERS[args.cipher])
     args.output.write(data)
+    if len(data) < sec["payload_len"]:
+        sys.stderr.write(f"Warning: section {args.section} is "
+                         f"{sec['payload_len'] // 4} words but only "
+                         f"{len(data) // 4} are decryptable\n")
     sys.stderr.write(f"Section {args.section}/{len(secs) - 1}: id={sec['id']} "
                      f"addr=0x{sec['addr']:08x} pid=0x{sec['pid']:04x} "
-                     f"payload_len={len(C) * 4}\n")
-    sys.stderr.write(f"Wrote {n} words ({len(data)} bytes) using "
-                     f"{args.cipher}\n")
+                     f"payload_len={sec['payload_len']}\n")
+    sys.stderr.write(f"Wrote {len(data) // 4} words ({len(data)} bytes) "
+                     f"using {args.cipher}\n")
 
 
 def cmd_encrypt(args):
     """Encrypt binary into a new firmware section."""
-    cipher = CIPHERS[args.cipher]
-    raw_in = args.infile.read()
-    length = args.length
-    if length is None:
-        length = len(raw_in) + -len(raw_in) % (BLOCK * 4)
-    if len(raw_in) > length:
-        raise SystemExit(f"Payload ({len(raw_in)} bytes) is longer than "
-                         f"length ({length} bytes)")
-    if length == 0 or length % (BLOCK * 4):
-        raise SystemExit(f"Length ({length} bytes) is not a positive "
-                         f"multiple of the block size ({BLOCK * 4} bytes)")
-    if length > cipher.MAX_BLOCKS * BLOCK * 4:
-        raise SystemExit(f"Length ({length} bytes) is longer than "
-                         f"{args.cipher} can encrypt "
-                         f"({cipher.MAX_BLOCKS * BLOCK * 4} bytes)")
-    pad = length - len(raw_in)
-    P, _ = words(raw_in + b"\xff" * pad)
-    C = encrypt_payload(P, cipher)
-    addr = cipher.BASE_ADDR if args.addr is None else args.addr
-    header = struct.pack("<IIII", args.version, addr, length, args.pid)
-    section = header + bytes(12) + struct.pack(f"<{len(C)}I", *C)
+    payload = args.infile.read()
+    section = build_section(payload, CIPHERS[args.cipher], args.version,
+                            args.addr, args.length, args.pid)
     index = 0
     if args.output == "-":
         sys.stdout.buffer.write(section)
     elif args.append:
         with open(args.output, "a+b") as f:
             f.seek(0)
-            index = read_image(f)
+            try:
+                index = len(parse_image(f.read()))
+            except ValueError as e:
+                raise ValueError(f"{args.output}: {e}")
             f.write(section)
     else:
         with open(args.output, "wb") as f:
             f.write(section)
+    sec = parse_sections(section)[0]
+    pad = sec["payload_len"] - len(payload)
     if pad:
         sys.stderr.write(f"Padded {pad} byte(s) with 0xFF\n")
-    sys.stderr.write(f"Encrypted {len(C)} words using {args.cipher} as "
-                     f"section {index}: id={args.version} addr=0x{addr:08x} "
-                     f"pid=0x{args.pid:04x} payload_len={length}\n")
+    sys.stderr.write(f"Encrypted {sec['payload_len'] // 4} words using "
+                     f"{args.cipher} as section {index}: id={sec['id']} "
+                     f"addr=0x{sec['addr']:08x} pid=0x{sec['pid']:04x} "
+                     f"payload_len={sec['payload_len']}\n")
 
 
 def u32(s):
@@ -306,7 +323,10 @@ def main():
                    help="Output file (default: stdout)")
     e.set_defaults(func=cmd_encrypt)
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except ValueError as e:
+        raise SystemExit(e)
 
 
 if __name__ == "__main__":

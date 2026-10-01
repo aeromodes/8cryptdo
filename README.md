@@ -6,7 +6,7 @@
 Reverse-engineered documentation and tooling for the firmware encryption used by
 8BitDo for several GD32-based products.
 
-See `8cryptdo.py` for a decryption and re-encryption tool applying the algorithm
+See `cryptdo8.py` for a decryption and re-encryption tool applying the algorithm
 described in this document.
 
 The tool potentially enables the possibility to create customized firmware.
