@@ -159,12 +159,12 @@ def parse_sections(raw):
     secs = []
     off = 0
     while off + 28 <= len(raw):
-        version, addr, payload_len = struct.unpack(
-            "<III", raw[off:off + 12])
+        version, addr, payload_len, pid = struct.unpack(
+            "<IIII", raw[off:off + 16])
         if payload_len <= 0 or off + 28 + payload_len > len(raw):
             break
         secs.append(dict(offset=off, id=version, addr=addr,
-                         payload_len=payload_len))
+                         payload_len=payload_len, pid=pid))
         off += 28 + payload_len
     return secs
 
@@ -203,7 +203,8 @@ def cmd_decrypt(args):
         data += tail
     args.output.write(data)
     sys.stderr.write(f"Section {args.section}/{len(secs) - 1}: id={sec['id']} "
-                     f"addr=0x{sec['addr']:08x} payload_len={len(C) * 4}\n")
+                     f"addr=0x{sec['addr']:08x} pid=0x{sec['pid']:04x} "
+                     f"payload_len={len(C) * 4}\n")
     sys.stderr.write(f"Wrote {n} words ({len(data)} bytes) using "
                      f"{args.cipher}\n")
 
